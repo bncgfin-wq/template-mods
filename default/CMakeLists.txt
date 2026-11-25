@@ -3,7 +3,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project({{ escaped_name }} VERSION 1.0.0)
+project(Modku VERSION 1.0.0)
 
 # Add all source files inside src (recursively)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
@@ -19,5 +19,5 @@ endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
-# Set up dependencies, resources, and link Geode.
+# Set up dependencies, resources, and link Geode
 setup_geode_mod(${PROJECT_NAME})
