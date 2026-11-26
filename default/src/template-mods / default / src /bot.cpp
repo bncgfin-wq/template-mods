@@ -2,8 +2,6 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <algorithm>
 #include <cctype>
-#include <filesystem>
-#include <fstream>
 #include <random>
 #include <string>
 #include <utility>
@@ -49,7 +47,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         Notification::create(text, ok ? NotificationIcon::Success : NotificationIcon::Error, 1.5f)->show();
     }
 
-    std::filesystem::path macroPath() {
+    std::string macroKey() {
         int id = m_level->m_levelID.value();
         std::string key;
         if (id > 0) {
@@ -61,27 +59,21 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             if (key.empty()) key = "local";
         }
-        return Mod::get()->getSaveDir() / ("macro_" + key + ".txt");
+        return "macro_" + key;
     }
 
     bool saveMacro() {
         if (m_fields->bestGenome.empty()) return false;
-        std::ofstream out(macroPath());
-        if (!out) return false;
         std::string bits;
         bits.reserve(m_fields->bestGenome.size());
         for (char c : m_fields->bestGenome) bits.push_back(c ? '1' : '0');
-        out << "GDBOT1\n" << m_fields->bestGenome.size() << "\n" << bits << "\n";
+        Mod::get()->setSavedValue<std::string>(macroKey(), bits);
         return true;
     }
 
     bool loadMacro() {
-        std::ifstream in(macroPath());
-        if (!in) return false;
-        std::string magic, bits;
-        int reached = 0;
-        in >> magic >> reached >> bits;
-        if (magic != "GDBOT1" || bits.empty()) return false;
+        std::string bits = Mod::get()->getSavedValue<std::string>(macroKey(), "");
+        if (bits.empty()) return false;
         m_fields->bestGenome.clear();
         for (char c : bits) m_fields->bestGenome.push_back(c == '1' ? 1 : 0);
         m_fields->bestReached = static_cast<int>(m_fields->bestGenome.size());
