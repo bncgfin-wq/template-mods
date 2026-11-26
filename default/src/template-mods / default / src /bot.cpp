@@ -2,30 +2,41 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <algorithm>
 #include <cctype>
-#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace geode::prelude;
+
+namespace {
+    struct Individual {
+        std::vector<char> genome;
+        int fitness = -1;
+        bool evaluated = false;
+    };
+}
 
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool enabled = false;
         bool holding = false;
         bool finished = false;
-        bool deathHandled = false;
+        bool improved = false;
         int frame = 0;
         int holdLeft = 0;
         int attempts = 0;
         int stuck = 0;
         int bestReached = 0;
+        int popSize = 10;
+        int gen = 1;
+        int idx = 0;
         std::vector<char> cur;
-        std::vector<char> best;
+        std::vector<char> bestGenome;
+        std::vector<Individual> pop;
         std::mt19937 rng{std::random_device{}()};
-        std::chrono::steady_clock::time_point lastInstant{};
         CCLabelBMFont* label = nullptr;
     };
 
@@ -54,13 +65,13 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     bool saveMacro() {
-        if (m_fields->best.empty()) return false;
+        if (m_fields->bestGenome.empty()) return false;
         std::ofstream out(macroPath());
         if (!out) return false;
         std::string bits;
-        bits.reserve(m_fields->best.size());
-        for (char c : m_fields->best) bits.push_back(c ? '1' : '0');
-        out << "GDBOT1\n" << m_fields->best.size() << "\n" << bits << "\n";
+        bits.reserve(m_fields->bestGenome.size());
+        for (char c : m_fields->bestGenome) bits.push_back(c ? '1' : '0');
+        out << "GDBOT1\n" << m_fields->bestGenome.size() << "\n" << bits << "\n";
         return true;
     }
 
@@ -71,17 +82,20 @@ class $modify(BotPlayLayer, PlayLayer) {
         int reached = 0;
         in >> magic >> reached >> bits;
         if (magic != "GDBOT1" || bits.empty()) return false;
-        m_fields->best.clear();
-        for (char c : bits) m_fields->best.push_back(c == '1' ? 1 : 0);
-        m_fields->bestReached = static_cast<int>(m_fields->best.size());
-        m_fields->stuck = 0;
+        m_fields->bestGenome.clear();
+        for (char c : bits) m_fields->bestGenome.push_back(c == '1' ? 1 : 0);
+        m_fields->bestReached = static_cast<int>(m_fields->bestGenome.size());
         return true;
     }
 
     void updateLabel() {
         if (!m_fields->label) return;
         std::string s = m_fields->finished ? "Bot: DONE!" : (m_fields->enabled ? "Bot: ON" : "Bot: OFF");
-        s += "  Tries " + std::to_string(m_fields->attempts);
+        s += "  Pop " + std::to_string(m_fields->popSize);
+        if (m_fields->enabled) {
+            s += "  Gen " + std::to_string(m_fields->gen);
+            s += "  #" + std::to_string(m_fields->idx + 1) + "/" + std::to_string(m_fields->popSize);
+        }
         s += "  Best " + std::to_string(m_fields->bestReached) + "f";
         s += "  Stuck " + std::to_string(m_fields->stuck);
         m_fields->label->setString(s.c_str());
@@ -94,15 +108,110 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
+    Individual makeChild(const Individual& parent) {
+        Individual child;
+        int far = static_cast<int>(parent.genome.size());
+        int back;
+        if (randInt(1, 100) <= 10) {
+            back = randInt(0, 400);
+        } else {
+            back = 6 + randInt(0, 24 + m_fields->stuck * 3);
+        }
+        back = std::min(back, 400);
+        int cut = std::max(0, far - back);
+        child.genome.assign(parent.genome.begin(), parent.genome.begin() + cut);
+        return child;
+    }
+
+    void skipEvaluated() {
+        while (m_fields->idx < static_cast<int>(m_fields->pop.size()) &&
+               m_fields->pop[m_fields->idx].evaluated) {
+            m_fields->idx++;
+        }
+    }
+
+    void initPopulation() {
+        m_fields->pop.assign(m_fields->popSize, Individual{});
+        m_fields->idx = 0;
+        m_fields->gen = 1;
+        m_fields->improved = false;
+        if (!m_fields->bestGenome.empty()) {
+            Individual seed;
+            seed.genome = m_fields->bestGenome;
+            seed.fitness = static_cast<int>(seed.genome.size());
+            seed.evaluated = true;
+            m_fields->pop[0] = seed;
+            for (int i = 1; i < m_fields->popSize; i++) {
+                m_fields->pop[i] = makeChild(seed);
+            }
+        }
+        skipEvaluated();
+    }
+
+    void nextGeneration() {
+        std::sort(m_fields->pop.begin(), m_fields->pop.end(),
+            [](const Individual& a, const Individual& b) { return a.fitness > b.fitness; });
+
+        if (m_fields->improved) m_fields->stuck = 0;
+        else m_fields->stuck++;
+        m_fields->improved = false;
+
+        int K = std::max(2, m_fields->popSize / 5);
+        K = std::min(K, static_cast<int>(m_fields->pop.size()));
+        std::vector<Individual> next;
+        next.reserve(m_fields->popSize);
+        for (int i = 0; i < K; i++) {
+            next.push_back(m_fields->pop[i]);
+            next.back().evaluated = true;
+        }
+        while (static_cast<int>(next.size()) < m_fields->popSize) {
+            int a = randInt(0, K - 1);
+            int b = randInt(0, K - 1);
+            Individual child = makeChild(next[std::min(a, b)]);
+            next.push_back(std::move(child));
+        }
+        m_fields->pop = std::move(next);
+        m_fields->idx = 0;
+        m_fields->gen++;
+        skipEvaluated();
+    }
+
+    void finishAttempt() {
+        int reached = m_fields->frame;
+        if (static_cast<int>(m_fields->cur.size()) > reached) {
+            m_fields->cur.resize(reached);
+        }
+        if (m_fields->pop.empty() || m_fields->idx >= static_cast<int>(m_fields->pop.size())) return;
+
+        Individual& ind = m_fields->pop[m_fields->idx];
+        ind.genome = m_fields->cur;
+        ind.fitness = reached;
+        ind.evaluated = true;
+
+        if (reached > m_fields->bestReached) {
+            m_fields->bestReached = reached;
+            m_fields->bestGenome = m_fields->cur;
+            m_fields->improved = true;
+        }
+
+        m_fields->idx++;
+        skipEvaluated();
+        if (m_fields->idx >= static_cast<int>(m_fields->pop.size())) {
+            nextGeneration();
+        }
+    }
+
     void startBot() {
         m_fields->finished = false;
-        m_fields->deathHandled = false;
         m_fields->attempts = 0;
         m_fields->stuck = 0;
+        m_fields->frame = 0;
+        m_fields->holding = false;
         m_fields->bestReached = 0;
-        m_fields->best.clear();
+        m_fields->bestGenome.clear();
         m_fields->cur.clear();
         if (loadMacro()) notify("Saved macro loaded", true);
+        initPopulation();
     }
 
     void prepareAttempt() {
@@ -110,21 +219,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         m_fields->holdLeft = 0;
         m_fields->holding = false;
         m_fields->attempts++;
-
-        int far = m_fields->bestReached;
-        int cut = 0;
-        if (far > 0) {
-            int back;
-            if (randInt(1, 100) <= 10) {
-                back = randInt(0, 400);
-            } else {
-                back = 6 + randInt(0, 24 + m_fields->stuck * 3);
-            }
-            back = std::min(back, 400);
-            cut = std::max(0, far - back);
+        if (m_fields->idx < static_cast<int>(m_fields->pop.size())) {
+            m_fields->cur = m_fields->pop[m_fields->idx].genome;
+        } else {
+            m_fields->cur.clear();
         }
-        cut = std::min(cut, static_cast<int>(m_fields->best.size()));
-        m_fields->cur.assign(m_fields->best.begin(), m_fields->best.begin() + cut);
     }
 
     bool sampleWant() {
@@ -181,10 +280,16 @@ class $modify(BotPlayLayer, PlayLayer) {
         loadBtn->setPosition(ccp(160.f, win.height - 75.f));
         menu->addChild(loadBtn);
 
+        auto popSpr = ButtonSprite::create("Pop");
+        popSpr->setScale(0.6f);
+        auto popBtn = CCMenuItemSpriteExtra::create(popSpr, this, menu_selector(BotPlayLayer::onPop));
+        popBtn->setPosition(ccp(220.f, win.height - 75.f));
+        menu->addChild(popBtn);
+
         this->addChild(menu, 1000);
 
         m_fields->label = CCLabelBMFont::create("Bot: OFF", "bigFont.fnt");
-        m_fields->label->setScale(0.35f);
+        m_fields->label->setScale(0.3f);
         m_fields->label->setAnchorPoint(ccp(0.f, 0.5f));
         m_fields->label->setPosition(ccp(15.f, win.height - 105.f));
         this->addChild(m_fields->label, 1000);
@@ -216,6 +321,20 @@ class $modify(BotPlayLayer, PlayLayer) {
         notify("Macro loaded", true);
         if (m_fields->enabled) {
             m_fields->finished = false;
+            m_fields->stuck = 0;
+            initPopulation();
+            m_fields->frame = 0;
+            this->resetLevel();
+        } else {
+            updateLabel();
+        }
+    }
+
+    void onPop(CCObject*) {
+        m_fields->popSize = (m_fields->popSize == 10) ? 50 : 10;
+        if (m_fields->enabled && !m_fields->finished) {
+            initPopulation();
+            m_fields->frame = 0;
             this->resetLevel();
         } else {
             updateLabel();
@@ -225,15 +344,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
         if (!m_fields->enabled || m_fields->finished) return;
-
-        if (m_player1->m_isDead) {
-            if (!m_fields->deathHandled) {
-                m_fields->deathHandled = true;
-                m_fields->lastInstant = std::chrono::steady_clock::now();
-                this->resetLevel();
-            }
-            return;
-        }
+        if (m_player1->m_isDead) return;
 
         bool want = false;
         if (m_fields->frame < static_cast<int>(m_fields->cur.size())) {
@@ -253,37 +364,12 @@ class $modify(BotPlayLayer, PlayLayer) {
         m_fields->frame++;
     }
 
-    void delayedResetLevel() {
-        if (m_fields->enabled) {
-            auto diff = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - m_fields->lastInstant).count();
-            if (diff < 2.5) return;
-        }
-        PlayLayer::delayedResetLevel();
-    }
-
     void resetLevel() {
         if (m_fields->enabled && !m_fields->finished && m_fields->frame > 5) {
-            int reached = m_fields->frame;
-            if (static_cast<int>(m_fields->cur.size()) > reached) {
-                m_fields->cur.resize(reached);
-            }
-            if (reached > m_fields->bestReached) {
-                m_fields->bestReached = reached;
-                m_fields->best = m_fields->cur;
-                m_fields->stuck = 0;
-            } else {
-                if (reached == m_fields->bestReached) {
-                    m_fields->best = m_fields->cur;
-                }
-                m_fields->stuck++;
-            }
+            finishAttempt();
         }
-
         PlayLayer::resetLevel();
         m_fields->holding = false;
-        m_fields->deathHandled = false;
-
         if (m_fields->enabled && !m_fields->finished) {
             prepareAttempt();
         } else {
@@ -297,7 +383,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->finished = true;
             stopHold();
             int n = std::min(static_cast<int>(m_fields->cur.size()), m_fields->frame);
-            m_fields->best.assign(m_fields->cur.begin(), m_fields->cur.begin() + n);
+            m_fields->bestGenome.assign(m_fields->cur.begin(), m_fields->cur.begin() + n);
             m_fields->bestReached = n;
             if (saveMacro()) notify("Level complete! Macro saved", true);
             updateLabel();
