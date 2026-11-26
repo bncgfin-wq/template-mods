@@ -1,22 +1,22 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
-#include <Geode/modify/PauseLayer.hpp>
 #include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
 
 using namespace geode::prelude;
 
-namespace {
-    bool g_botEnabled = false;
-}
-
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool enabled = false;
         bool holding = false;
         bool finished = false;
+        bool deathHandled = false;
         int frame = 0;
         int holdLeft = 0;
         int attempts = 0;
@@ -25,6 +25,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         std::vector<char> cur;
         std::vector<char> best;
         std::mt19937 rng{std::random_device{}()};
+        std::chrono::steady_clock::time_point lastInstant{};
         CCLabelBMFont* label = nullptr;
     };
 
@@ -33,13 +34,56 @@ class $modify(BotPlayLayer, PlayLayer) {
         return dist(m_fields->rng);
     }
 
+    void notify(const char* text, bool ok) {
+        Notification::create(text, ok ? NotificationIcon::Success : NotificationIcon::Error, 1.5f)->show();
+    }
+
+    std::filesystem::path macroPath() {
+        int id = m_level->m_levelID.value();
+        std::string key;
+        if (id > 0) {
+            key = std::to_string(id);
+        } else {
+            std::string name = m_level->m_levelName;
+            for (char c : name) {
+                if (std::isalnum(static_cast<unsigned char>(c))) key.push_back(c);
+            }
+            if (key.empty()) key = "local";
+        }
+        return Mod::get()->getSaveDir() / ("macro_" + key + ".txt");
+    }
+
+    bool saveMacro() {
+        if (m_fields->best.empty()) return false;
+        std::ofstream out(macroPath());
+        if (!out) return false;
+        std::string bits;
+        bits.reserve(m_fields->best.size());
+        for (char c : m_fields->best) bits.push_back(c ? '1' : '0');
+        out << "GDBOT1\n" << m_fields->best.size() << "\n" << bits << "\n";
+        return true;
+    }
+
+    bool loadMacro() {
+        std::ifstream in(macroPath());
+        if (!in) return false;
+        std::string magic, bits;
+        int reached = 0;
+        in >> magic >> reached >> bits;
+        if (magic != "GDBOT1" || bits.empty()) return false;
+        m_fields->best.clear();
+        for (char c : bits) m_fields->best.push_back(c == '1' ? 1 : 0);
+        m_fields->bestReached = static_cast<int>(m_fields->best.size());
+        m_fields->stuck = 0;
+        return true;
+    }
+
     void updateLabel() {
         if (!m_fields->label) return;
-        m_fields->label->setVisible(m_fields->enabled);
-        std::string s = m_fields->finished ? "Bot: SELESAI!" : "Bot: ON";
-        s += "  Coba " + std::to_string(m_fields->attempts);
-        s += "  Terjauh " + std::to_string(m_fields->bestReached) + "f";
-        s += "  Macet " + std::to_string(m_fields->stuck);
+        std::string s = m_fields->finished ? "Bot: DONE!" : (m_fields->enabled ? "Bot: ON" : "Bot: OFF");
+        s += "  Tries " + std::to_string(m_fields->attempts);
+        s += "  Best " + std::to_string(m_fields->bestReached) + "f";
+        s += "  Stuck " + std::to_string(m_fields->stuck);
         m_fields->label->setString(s.c_str());
     }
 
@@ -51,13 +95,14 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void startBot() {
-        m_fields->enabled = true;
         m_fields->finished = false;
+        m_fields->deathHandled = false;
         m_fields->attempts = 0;
         m_fields->stuck = 0;
         m_fields->bestReached = 0;
         m_fields->best.clear();
         m_fields->cur.clear();
+        if (loadMacro()) notify("Saved macro loaded", true);
     }
 
     void prepareAttempt() {
@@ -69,13 +114,14 @@ class $modify(BotPlayLayer, PlayLayer) {
         int far = m_fields->bestReached;
         int cut = 0;
         if (far > 0) {
-            if (randInt(1, 100) <= 15) {
-                cut = randInt(std::max(0, far - 600), far);
+            int back;
+            if (randInt(1, 100) <= 10) {
+                back = randInt(0, 400);
             } else {
-                int window = 10 + randInt(0, 20 + m_fields->stuck * 4);
-                window = std::min(window, 400);
-                cut = std::max(0, far - window);
+                back = 6 + randInt(0, 24 + m_fields->stuck * 3);
             }
+            back = std::min(back, 400);
+            cut = std::max(0, far - back);
         }
         cut = std::min(cut, static_cast<int>(m_fields->best.size()));
         m_fields->cur.assign(m_fields->best.begin(), m_fields->best.begin() + cut);
@@ -83,23 +129,25 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     bool sampleWant() {
         auto* p = m_player1;
-        bool holdMode = p->m_isShip || p->m_isDart || p->m_isSwing;
-        if (holdMode) {
+        if (p->m_isShip || p->m_isDart || p->m_isSwing) {
             int roll = randInt(1, 100);
-            if (m_fields->holding) return roll > 12;
-            return roll <= 12;
+            return m_fields->holding ? roll > 10 : roll <= 10;
         }
         if (m_fields->holdLeft > 0) {
             m_fields->holdLeft--;
             return true;
         }
-        int chance = 1;
-        int maxHold = 14;
+        int chance;
+        int maxHold;
         if (p->m_isBird) {
-            chance = 10;
-            maxHold = 2;
+            chance = 8;
+            maxHold = 1;
+        } else if (p->m_isOnGround) {
+            chance = 6;
+            maxHold = 14;
         } else {
-            chance = p->m_isOnGround ? 6 : 1;
+            chance = 1;
+            maxHold = 6;
         }
         if (randInt(1, 100) <= chance) {
             m_fields->holdLeft = randInt(0, maxHold);
@@ -110,30 +158,82 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
-        g_botEnabled = false;
         auto win = CCDirector::sharedDirector()->getWinSize();
+
+        auto menu = CCMenu::create();
+        menu->setPosition(ccp(0.f, 0.f));
+
+        auto botSpr = ButtonSprite::create("Bot");
+        botSpr->setScale(0.6f);
+        auto botBtn = CCMenuItemSpriteExtra::create(botSpr, this, menu_selector(BotPlayLayer::onToggleBot));
+        botBtn->setPosition(ccp(40.f, win.height - 75.f));
+        menu->addChild(botBtn);
+
+        auto saveSpr = ButtonSprite::create("Save");
+        saveSpr->setScale(0.6f);
+        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotPlayLayer::onSave));
+        saveBtn->setPosition(ccp(100.f, win.height - 75.f));
+        menu->addChild(saveBtn);
+
+        auto loadSpr = ButtonSprite::create("Load");
+        loadSpr->setScale(0.6f);
+        auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotPlayLayer::onLoad));
+        loadBtn->setPosition(ccp(160.f, win.height - 75.f));
+        menu->addChild(loadBtn);
+
+        this->addChild(menu, 1000);
 
         m_fields->label = CCLabelBMFont::create("Bot: OFF", "bigFont.fnt");
         m_fields->label->setScale(0.35f);
         m_fields->label->setAnchorPoint(ccp(0.f, 0.5f));
-        m_fields->label->setPosition(ccp(15.f, win.height - 75.f));
+        m_fields->label->setPosition(ccp(15.f, win.height - 105.f));
         this->addChild(m_fields->label, 1000);
         updateLabel();
     }
 
+    void onToggleBot(CCObject*) {
+        m_fields->enabled = !m_fields->enabled;
+        if (m_fields->enabled) {
+            startBot();
+            this->resetLevel();
+        } else {
+            stopHold();
+            saveMacro();
+            updateLabel();
+        }
+    }
+
+    void onSave(CCObject*) {
+        if (saveMacro()) notify("Macro saved", true);
+        else notify("Nothing to save yet", false);
+    }
+
+    void onLoad(CCObject*) {
+        if (!loadMacro()) {
+            notify("No saved macro for this level", false);
+            return;
+        }
+        notify("Macro loaded", true);
+        if (m_fields->enabled) {
+            m_fields->finished = false;
+            this->resetLevel();
+        } else {
+            updateLabel();
+        }
+    }
+
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
+        if (!m_fields->enabled || m_fields->finished) return;
 
-        if (!g_botEnabled) {
-            if (m_fields->enabled) {
-                m_fields->enabled = false;
-                stopHold();
-                updateLabel();
+        if (m_player1->m_isDead) {
+            if (!m_fields->deathHandled) {
+                m_fields->deathHandled = true;
+                m_fields->lastInstant = std::chrono::steady_clock::now();
+                this->resetLevel();
             }
             return;
         }
-        if (!m_fields->enabled || m_fields->finished) return;
-        if (m_player1->m_isDead) return;
 
         bool want = false;
         if (m_fields->frame < static_cast<int>(m_fields->cur.size())) {
@@ -151,6 +251,15 @@ class $modify(BotPlayLayer, PlayLayer) {
             m_fields->holding = false;
         }
         m_fields->frame++;
+    }
+
+    void delayedResetLevel() {
+        if (m_fields->enabled) {
+            auto diff = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - m_fields->lastInstant).count();
+            if (diff < 2.5) return;
+        }
+        PlayLayer::delayedResetLevel();
     }
 
     void resetLevel() {
@@ -171,14 +280,9 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
         }
 
-        if (g_botEnabled && !m_fields->enabled) {
-            startBot();
-        } else if (!g_botEnabled && m_fields->enabled) {
-            m_fields->enabled = false;
-        }
-
         PlayLayer::resetLevel();
         m_fields->holding = false;
+        m_fields->deathHandled = false;
 
         if (m_fields->enabled && !m_fields->finished) {
             prepareAttempt();
@@ -189,43 +293,15 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void levelComplete() {
-        if (m_fields->enabled) {
+        if (m_fields->enabled && !m_fields->finished) {
             m_fields->finished = true;
             stopHold();
+            int n = std::min(static_cast<int>(m_fields->cur.size()), m_fields->frame);
+            m_fields->best.assign(m_fields->cur.begin(), m_fields->cur.begin() + n);
+            m_fields->bestReached = n;
+            if (saveMacro()) notify("Level complete! Macro saved", true);
             updateLabel();
         }
         PlayLayer::levelComplete();
-    }
-};
-
-class $modify(BotPauseLayer, PauseLayer) {
-    void customSetup() {
-        PauseLayer::customSetup();
-
-        auto menu = CCMenu::create();
-        menu->setPosition(ccp(0.f, 0.f));
-
-        auto toggler = CCMenuItemToggler::createWithStandardSprites(
-            this, menu_selector(BotPauseLayer::onBotToggle), 0.8f);
-        toggler->toggle(g_botEnabled);
-        toggler->setPosition(ccp(40.f, 45.f));
-        menu->addChild(toggler);
-
-        auto label = CCLabelBMFont::create("Bot", "bigFont.fnt");
-        label->setScale(0.5f);
-        label->setAnchorPoint(ccp(0.f, 0.5f));
-        label->setPosition(ccp(65.f, 45.f));
-        menu->addChild(label);
-
-        this->addChild(menu, 100);
-    }
-
-    void onBotToggle(CCObject* sender) {
-        auto toggler = static_cast<CCMenuItemToggler*>(sender);
-        bool on = !toggler->isToggled();
-        g_botEnabled = on;
-        if (on) {
-            this->onRestart(nullptr);
-        }
     }
 };
