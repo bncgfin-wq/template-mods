@@ -9,33 +9,23 @@
 
 using namespace geode::prelude;
 
-namespace {
-    struct Individual {
-        std::vector<char> genome;
-        int fitness = -1;
-        bool evaluated = false;
-    };
-}
-
 class $modify(BotPlayLayer, PlayLayer) {
     struct Fields {
         bool enabled = false;
+        bool playing = false;
         bool holding = false;
         bool finished = false;
-        bool improved = false;
         int frame = 0;
         int holdLeft = 0;
         int attempts = 0;
-        int stuck = 0;
         int bestReached = 0;
-        int popSize = 10;
-        int gen = 1;
-        int idx = 0;
+        int sel = 0;
         std::vector<char> cur;
-        std::vector<char> bestGenome;
-        std::vector<Individual> pop;
+        std::vector<char> best;
+        std::vector<char> play;
         std::mt19937 rng{std::random_device{}()};
         CCLabelBMFont* label = nullptr;
+        CCLabelBMFont* selLabel = nullptr;
     };
 
     int randInt(int lo, int hi) {
@@ -43,11 +33,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         return dist(m_fields->rng);
     }
 
-    void notify(const char* text, bool ok) {
+    void notify(const std::string& text, bool ok) {
         Notification::create(text, ok ? NotificationIcon::Success : NotificationIcon::Error, 1.5f)->show();
     }
 
-    std::string macroKey() {
+    std::string levelKey() {
         int id = m_level->m_levelID.value();
         std::string key;
         if (id > 0) {
@@ -59,37 +49,68 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
             if (key.empty()) key = "local";
         }
-        return "macro_" + key;
+        return key;
     }
 
-    bool saveMacro() {
-        if (m_fields->bestGenome.empty()) return false;
-        std::string bits;
-        bits.reserve(m_fields->bestGenome.size());
-        for (char c : m_fields->bestGenome) bits.push_back(c ? '1' : '0');
-        Mod::get()->setSavedValue<std::string>(macroKey(), bits);
-        return true;
+    std::vector<std::pair<std::string, std::string>> readList() {
+        std::vector<std::pair<std::string, std::string>> out;
+        std::string raw = Mod::get()->getSavedValue<std::string>("list_" + levelKey(), "");
+        size_t start = 0;
+        while (start < raw.size()) {
+            size_t end = raw.find('\n', start);
+            if (end == std::string::npos) end = raw.size();
+            std::string line = raw.substr(start, end - start);
+            size_t bar = line.find('|');
+            if (bar != std::string::npos && bar + 1 < line.size()) {
+                out.push_back({line.substr(0, bar), line.substr(bar + 1)});
+            }
+            start = end + 1;
+        }
+        return out;
     }
 
-    bool loadMacro() {
-        std::string bits = Mod::get()->getSavedValue<std::string>(macroKey(), "");
-        if (bits.empty()) return false;
-        m_fields->bestGenome.clear();
-        for (char c : bits) m_fields->bestGenome.push_back(c == '1' ? 1 : 0);
-        m_fields->bestReached = static_cast<int>(m_fields->bestGenome.size());
-        return true;
+    void writeList(const std::vector<std::pair<std::string, std::string>>& list) {
+        std::string raw;
+        for (auto& e : list) {
+            raw += e.first + "|" + e.second + "\n";
+        }
+        Mod::get()->setSavedValue<std::string>("list_" + levelKey(), raw);
+        Mod::get()->saveData();
+    }
+
+    void clampSel(size_t n) {
+        if (n == 0) {
+            m_fields->sel = 0;
+        } else if (m_fields->sel >= static_cast<int>(n)) {
+            m_fields->sel = static_cast<int>(n) - 1;
+        } else if (m_fields->sel < 0) {
+            m_fields->sel = 0;
+        }
+    }
+
+    void refreshSel() {
+        if (!m_fields->selLabel) return;
+        auto list = readList();
+        clampSel(list.size());
+        if (list.empty()) {
+            m_fields->selLabel->setString("Saved: none");
+            return;
+        }
+        auto& e = list[m_fields->sel];
+        std::string s = "Saved: " + e.first + " (" + std::to_string(e.second.size()) + "f) [" +
+            std::to_string(m_fields->sel + 1) + "/" + std::to_string(list.size()) + "]";
+        m_fields->selLabel->setString(s.c_str());
     }
 
     void updateLabel() {
         if (!m_fields->label) return;
-        std::string s = m_fields->finished ? "Bot: DONE!" : (m_fields->enabled ? "Bot: ON" : "Bot: OFF");
-        s += "  Pop " + std::to_string(m_fields->popSize);
-        if (m_fields->enabled) {
-            s += "  Gen " + std::to_string(m_fields->gen);
-            s += "  #" + std::to_string(m_fields->idx + 1) + "/" + std::to_string(m_fields->popSize);
-        }
+        std::string s;
+        if (m_fields->playing) s = "Bot: PLAY";
+        else if (m_fields->finished) s = "Bot: DONE!";
+        else if (m_fields->enabled) s = "Bot: ON";
+        else s = "Bot: OFF";
+        s += "  Tries " + std::to_string(m_fields->attempts);
         s += "  Best " + std::to_string(m_fields->bestReached) + "f";
-        s += "  Stuck " + std::to_string(m_fields->stuck);
         m_fields->label->setString(s.c_str());
     }
 
@@ -100,110 +121,20 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    Individual makeChild(const Individual& parent) {
-        Individual child;
-        int far = static_cast<int>(parent.genome.size());
-        int back;
-        if (randInt(1, 100) <= 10) {
-            back = randInt(0, 400);
-        } else {
-            back = 6 + randInt(0, 24 + m_fields->stuck * 3);
-        }
-        back = std::min(back, 400);
-        int cut = std::max(0, far - back);
-        child.genome.assign(parent.genome.begin(), parent.genome.begin() + cut);
-        return child;
-    }
-
-    void skipEvaluated() {
-        while (m_fields->idx < static_cast<int>(m_fields->pop.size()) &&
-               m_fields->pop[m_fields->idx].evaluated) {
-            m_fields->idx++;
-        }
-    }
-
-    void initPopulation() {
-        m_fields->pop.assign(m_fields->popSize, Individual{});
-        m_fields->idx = 0;
-        m_fields->gen = 1;
-        m_fields->improved = false;
-        if (!m_fields->bestGenome.empty()) {
-            Individual seed;
-            seed.genome = m_fields->bestGenome;
-            seed.fitness = static_cast<int>(seed.genome.size());
-            seed.evaluated = true;
-            m_fields->pop[0] = seed;
-            for (int i = 1; i < m_fields->popSize; i++) {
-                m_fields->pop[i] = makeChild(seed);
-            }
-        }
-        skipEvaluated();
-    }
-
-    void nextGeneration() {
-        std::sort(m_fields->pop.begin(), m_fields->pop.end(),
-            [](const Individual& a, const Individual& b) { return a.fitness > b.fitness; });
-
-        if (m_fields->improved) m_fields->stuck = 0;
-        else m_fields->stuck++;
-        m_fields->improved = false;
-
-        int K = std::max(2, m_fields->popSize / 5);
-        K = std::min(K, static_cast<int>(m_fields->pop.size()));
-        std::vector<Individual> next;
-        next.reserve(m_fields->popSize);
-        for (int i = 0; i < K; i++) {
-            next.push_back(m_fields->pop[i]);
-            next.back().evaluated = true;
-        }
-        while (static_cast<int>(next.size()) < m_fields->popSize) {
-            int a = randInt(0, K - 1);
-            int b = randInt(0, K - 1);
-            Individual child = makeChild(next[std::min(a, b)]);
-            next.push_back(std::move(child));
-        }
-        m_fields->pop = std::move(next);
-        m_fields->idx = 0;
-        m_fields->gen++;
-        skipEvaluated();
-    }
-
-    void finishAttempt() {
-        int reached = m_fields->frame;
-        if (static_cast<int>(m_fields->cur.size()) > reached) {
-            m_fields->cur.resize(reached);
-        }
-        if (m_fields->pop.empty() || m_fields->idx >= static_cast<int>(m_fields->pop.size())) return;
-
-        Individual& ind = m_fields->pop[m_fields->idx];
-        ind.genome = m_fields->cur;
-        ind.fitness = reached;
-        ind.evaluated = true;
-
-        if (reached > m_fields->bestReached) {
-            m_fields->bestReached = reached;
-            m_fields->bestGenome = m_fields->cur;
-            m_fields->improved = true;
-        }
-
-        m_fields->idx++;
-        skipEvaluated();
-        if (m_fields->idx >= static_cast<int>(m_fields->pop.size())) {
-            nextGeneration();
-        }
-    }
-
-    void startBot() {
-        m_fields->finished = false;
-        m_fields->attempts = 0;
-        m_fields->stuck = 0;
-        m_fields->frame = 0;
-        m_fields->holding = false;
-        m_fields->bestReached = 0;
-        m_fields->bestGenome.clear();
-        m_fields->cur.clear();
-        if (loadMacro()) notify("Saved macro loaded", true);
-        initPopulation();
+    std::string saveBest() {
+        if (m_fields->best.empty()) return "";
+        auto list = readList();
+        int n = Mod::get()->getSavedValue<int>("cnt_" + levelKey(), 0) + 1;
+        Mod::get()->setSavedValue<int>("cnt_" + levelKey(), n);
+        std::string name = "Macro " + std::to_string(n);
+        std::string bits;
+        bits.reserve(m_fields->best.size());
+        for (char c : m_fields->best) bits.push_back(c ? '1' : '0');
+        list.push_back({name, bits});
+        writeList(list);
+        m_fields->sel = static_cast<int>(list.size()) - 1;
+        refreshSel();
+        return name + " (" + std::to_string(bits.size()) + "f)";
     }
 
     void prepareAttempt() {
@@ -211,138 +142,171 @@ class $modify(BotPlayLayer, PlayLayer) {
         m_fields->holdLeft = 0;
         m_fields->holding = false;
         m_fields->attempts++;
-        if (m_fields->idx < static_cast<int>(m_fields->pop.size())) {
-            m_fields->cur = m_fields->pop[m_fields->idx].genome;
-        } else {
-            m_fields->cur.clear();
-        }
-    }
-
-    bool sampleWant() {
-        auto* p = m_player1;
-        if (p->m_isShip || p->m_isDart || p->m_isSwing) {
-            int roll = randInt(1, 100);
-            return m_fields->holding ? roll > 10 : roll <= 10;
-        }
-        if (m_fields->holdLeft > 0) {
-            m_fields->holdLeft--;
-            return true;
-        }
-        int chance;
-        int maxHold;
-        if (p->m_isBird) {
-            chance = 8;
-            maxHold = 1;
-        } else if (p->m_isOnGround) {
-            chance = 6;
-            maxHold = 14;
-        } else {
-            chance = 1;
-            maxHold = 6;
-        }
-        if (randInt(1, 100) <= chance) {
-            m_fields->holdLeft = randInt(0, maxHold);
-            return true;
-        }
-        return false;
+        int cut = std::max(0, m_fields->bestReached - randInt(15, 90));
+        cut = std::min(cut, static_cast<int>(m_fields->best.size()));
+        m_fields->cur.assign(m_fields->best.begin(), m_fields->best.begin() + cut);
     }
 
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
         auto win = CCDirector::sharedDirector()->getWinSize();
+        float y1 = win.height - 75.f;
+        float y2 = win.height - 100.f;
 
         auto menu = CCMenu::create();
         menu->setPosition(ccp(0.f, 0.f));
 
-        auto botSpr = ButtonSprite::create("Bot");
-        botSpr->setScale(0.6f);
-        auto botBtn = CCMenuItemSpriteExtra::create(botSpr, this, menu_selector(BotPlayLayer::onToggleBot));
-        botBtn->setPosition(ccp(40.f, win.height - 75.f));
-        menu->addChild(botBtn);
+        auto addBtn = [&](const char* text, SEL_MenuHandler cb, float x, float y) {
+            auto spr = ButtonSprite::create(text);
+            spr->setScale(0.6f);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
+            btn->setPosition(ccp(x, y));
+            menu->addChild(btn);
+        };
 
-        auto saveSpr = ButtonSprite::create("Save");
-        saveSpr->setScale(0.6f);
-        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotPlayLayer::onSave));
-        saveBtn->setPosition(ccp(100.f, win.height - 75.f));
-        menu->addChild(saveBtn);
-
-        auto loadSpr = ButtonSprite::create("Load");
-        loadSpr->setScale(0.6f);
-        auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotPlayLayer::onLoad));
-        loadBtn->setPosition(ccp(160.f, win.height - 75.f));
-        menu->addChild(loadBtn);
-
-        auto popSpr = ButtonSprite::create("Pop");
-        popSpr->setScale(0.6f);
-        auto popBtn = CCMenuItemSpriteExtra::create(popSpr, this, menu_selector(BotPlayLayer::onPop));
-        popBtn->setPosition(ccp(220.f, win.height - 75.f));
-        menu->addChild(popBtn);
+        addBtn("Bot", menu_selector(BotPlayLayer::onToggleBot), 40.f, y1);
+        addBtn("Save", menu_selector(BotPlayLayer::onSave), 100.f, y1);
+        addBtn("Load", menu_selector(BotPlayLayer::onLoad), 160.f, y1);
+        addBtn("Del", menu_selector(BotPlayLayer::onDelete), 220.f, y1);
+        addBtn("Prev", menu_selector(BotPlayLayer::onPrev), 40.f, y2);
+        addBtn("Next", menu_selector(BotPlayLayer::onNext), 100.f, y2);
+        addBtn("Play", menu_selector(BotPlayLayer::onPlay), 160.f, y2);
 
         this->addChild(menu, 1000);
 
         m_fields->label = CCLabelBMFont::create("Bot: OFF", "bigFont.fnt");
         m_fields->label->setScale(0.3f);
         m_fields->label->setAnchorPoint(ccp(0.f, 0.5f));
-        m_fields->label->setPosition(ccp(15.f, win.height - 105.f));
+        m_fields->label->setPosition(ccp(15.f, win.height - 125.f));
         this->addChild(m_fields->label, 1000);
+
+        m_fields->selLabel = CCLabelBMFont::create("Saved: none", "bigFont.fnt");
+        m_fields->selLabel->setScale(0.3f);
+        m_fields->selLabel->setAnchorPoint(ccp(0.f, 0.5f));
+        m_fields->selLabel->setPosition(ccp(15.f, win.height - 142.f));
+        this->addChild(m_fields->selLabel, 1000);
+
         updateLabel();
+        refreshSel();
     }
 
     void onToggleBot(CCObject*) {
+        m_fields->playing = false;
         m_fields->enabled = !m_fields->enabled;
         if (m_fields->enabled) {
-            startBot();
+            m_fields->finished = false;
+            m_fields->attempts = 0;
+            m_fields->bestReached = static_cast<int>(m_fields->best.size());
+            m_fields->cur.clear();
             this->resetLevel();
         } else {
             stopHold();
-            saveMacro();
             updateLabel();
         }
     }
 
     void onSave(CCObject*) {
-        if (saveMacro()) notify("Macro saved", true);
-        else notify("Nothing to save yet", false);
+        std::string name = saveBest();
+        if (name.empty()) notify("Nothing to save yet", false);
+        else notify("Saved: " + name, true);
     }
 
     void onLoad(CCObject*) {
-        if (!loadMacro()) {
-            notify("No saved macro for this level", false);
+        auto list = readList();
+        if (list.empty()) {
+            notify("No saved macros for this level", false);
             return;
         }
-        notify("Macro loaded", true);
+        clampSel(list.size());
+        auto& e = list[m_fields->sel];
+        m_fields->best.clear();
+        for (char c : e.second) m_fields->best.push_back(c == '1' ? 1 : 0);
+        m_fields->bestReached = static_cast<int>(m_fields->best.size());
+        notify("Loaded: " + e.first, true);
         if (m_fields->enabled) {
             m_fields->finished = false;
-            m_fields->stuck = 0;
-            initPopulation();
-            m_fields->frame = 0;
             this->resetLevel();
         } else {
             updateLabel();
         }
     }
 
-    void onPop(CCObject*) {
-        m_fields->popSize = (m_fields->popSize == 10) ? 50 : 10;
-        if (m_fields->enabled && !m_fields->finished) {
-            initPopulation();
-            m_fields->frame = 0;
-            this->resetLevel();
-        } else {
-            updateLabel();
+    void onDelete(CCObject*) {
+        auto list = readList();
+        if (list.empty()) {
+            notify("No saved macros for this level", false);
+            return;
         }
+        clampSel(list.size());
+        std::string name = list[m_fields->sel].first;
+        list.erase(list.begin() + m_fields->sel);
+        writeList(list);
+        clampSel(list.size());
+        refreshSel();
+        notify("Deleted: " + name, true);
+    }
+
+    void onPrev(CCObject*) {
+        auto list = readList();
+        if (list.empty()) return;
+        int n = static_cast<int>(list.size());
+        m_fields->sel = (m_fields->sel + n - 1) % n;
+        refreshSel();
+    }
+
+    void onNext(CCObject*) {
+        auto list = readList();
+        if (list.empty()) return;
+        int n = static_cast<int>(list.size());
+        m_fields->sel = (m_fields->sel + 1) % n;
+        refreshSel();
+    }
+
+    void onPlay(CCObject*) {
+        if (m_fields->playing) {
+            m_fields->playing = false;
+            stopHold();
+            updateLabel();
+            return;
+        }
+        auto list = readList();
+        if (list.empty()) {
+            notify("No saved macros for this level", false);
+            return;
+        }
+        clampSel(list.size());
+        auto& e = list[m_fields->sel];
+        m_fields->play.clear();
+        for (char c : e.second) m_fields->play.push_back(c == '1' ? 1 : 0);
+        m_fields->enabled = false;
+        stopHold();
+        m_fields->playing = true;
+        m_fields->finished = false;
+        notify("Replaying: " + e.first, true);
+        this->resetLevel();
     }
 
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
-        if (!m_fields->enabled || m_fields->finished) return;
+        if (m_fields->finished) return;
+        if (!m_fields->enabled && !m_fields->playing) return;
         if (m_player1->m_isDead) return;
 
         bool want = false;
-        if (m_fields->frame < static_cast<int>(m_fields->cur.size())) {
+        if (m_fields->playing) {
+            if (m_fields->frame < static_cast<int>(m_fields->play.size())) {
+                want = m_fields->play[m_fields->frame] != 0;
+            }
+        } else if (m_fields->frame < static_cast<int>(m_fields->cur.size())) {
             want = m_fields->cur[m_fields->frame] != 0;
         } else {
-            want = sampleWant();
+            if (m_fields->holdLeft > 0) {
+                want = true;
+                m_fields->holdLeft--;
+            } else if (randInt(1, 100) <= 4) {
+                m_fields->holdLeft = randInt(2, 14);
+                want = true;
+            }
             m_fields->cur.push_back(want ? 1 : 0);
         }
 
@@ -358,7 +322,14 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     void resetLevel() {
         if (m_fields->enabled && !m_fields->finished && m_fields->frame > 5) {
-            finishAttempt();
+            int reached = m_fields->frame;
+            if (static_cast<int>(m_fields->cur.size()) > reached) {
+                m_fields->cur.resize(reached);
+            }
+            if (reached >= m_fields->bestReached) {
+                m_fields->bestReached = reached;
+                m_fields->best = m_fields->cur;
+            }
         }
         PlayLayer::resetLevel();
         m_fields->holding = false;
@@ -371,13 +342,19 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void levelComplete() {
-        if (m_fields->enabled && !m_fields->finished) {
+        if ((m_fields->enabled || m_fields->playing) && !m_fields->finished) {
+            bool wasLearning = m_fields->enabled;
             m_fields->finished = true;
             stopHold();
-            int n = std::min(static_cast<int>(m_fields->cur.size()), m_fields->frame);
-            m_fields->bestGenome.assign(m_fields->cur.begin(), m_fields->cur.begin() + n);
-            m_fields->bestReached = n;
-            if (saveMacro()) notify("Level complete! Macro saved", true);
+            if (wasLearning) {
+                int n = std::min(static_cast<int>(m_fields->cur.size()), m_fields->frame);
+                m_fields->best.assign(m_fields->cur.begin(), m_fields->cur.begin() + n);
+                m_fields->bestReached = n;
+                std::string name = saveBest();
+                if (!name.empty()) notify("Level complete! Saved: " + name, true);
+            } else {
+                notify("Replay finished", true);
+            }
             updateLabel();
         }
         PlayLayer::levelComplete();
